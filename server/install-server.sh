@@ -164,6 +164,14 @@ systemctl enable --now spt-vpn-enroll
 nginx -t
 systemctl reload nginx || systemctl restart nginx
 
+# --- Firewall ---------------------------------------------------------------
+# Ubuntu's UFW defaults to deny inbound. The Azure NSG is a separate layer
+# and is not enough on its own - if UFW is active we must open 443 here too.
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow 443/tcp comment 'spt-vpn enroll API' >/dev/null
+    echo "UFW: opened 443/tcp"
+fi
+
 # --- Final report ------------------------------------------------------------
 FP=$(openssl x509 -in "$CRT" -noout -fingerprint -sha256 | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')
 
