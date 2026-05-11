@@ -170,11 +170,9 @@ def enroll() -> Any:
     with _lock:
         invites = _invites()
         record = invites["tokens"][auth["token"]]
-        # Re-enroll on same token: reuse the assigned address unless the
-        # token is marked rebindable.
-        if record.get("pubkey") and record["pubkey"] != pubkey:
-            if not record.get("rebindable", False):
-                abort(409, "token already used by a different key")
+        # The token itself is the credential. If a friend re-runs the installer
+        # (fresh key generated each time), accept the new pubkey and overwrite
+        # the binding. Existing IP allocation is preserved.
         if not record.get("address"):
             record["address"] = _allocate_ip(invites, cfg)
         record["pubkey"] = pubkey

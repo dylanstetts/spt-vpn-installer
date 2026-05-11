@@ -149,11 +149,19 @@ $confLines += @(
 $plainConf = Join-Path $WorkDir "$TunnelName.conf"
 Set-Content -Path $plainConf -Value ($confLines -join "`r`n") -Encoding ASCII
 
-& $WgExe /uninstalltunnelservice $TunnelName 2>$null | Out-Null
+# Best-effort uninstall of any prior tunnel of the same name. Native CLIs
+# that write to stderr can trip Stop-mode error handling, so we route
+# through Start-Process and ignore the exit code entirely.
+try {
+    Start-Process -FilePath $WgExe `
+        -ArgumentList @('/uninstalltunnelservice', $TunnelName) `
+        -Wait -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+} catch { }
+
 Log "Installing tunnel service '$TunnelName'..."
 $p = Start-Process -FilePath $WgExe `
         -ArgumentList @('/installtunnelservice', "`"$plainConf`"") `
-        -Wait -PassThru
+        -Wait -PassThru -WindowStyle Hidden
 if ($p.ExitCode -ne 0) { throw "wireguard /installtunnelservice exit $($p.ExitCode)" }
 
 Log "Waiting up to 30s for tunnel to come up..."
