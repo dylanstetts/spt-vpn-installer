@@ -1,0 +1,23 @@
+# Example /etc/wireguard/wg0.conf
+#
+# install-server.sh injects the BEGIN/END markers below into your real
+# wg0.conf (without touching anything else). The enrollment service
+# rewrites only the content BETWEEN those markers via `wg syncconf`.
+# Hand-added peers (e.g. Sunshine clients) outside the block are
+# preserved across syncs.
+
+[Interface]
+Address    = 10.8.0.1/24
+ListenPort = 51820
+PrivateKey = REPLACE_WITH_SERVER_PRIVATE_KEY
+
+# Hand-added peers (e.g. Sunshine / RustDesk clients) go here, OUTSIDE
+# the managed block. Example:
+#
+# [Peer]
+# # this-pc (controlled Windows host)
+# PublicKey  = <pubkey>
+# AllowedIPs = 10.8.0.2/32
+
+# >>> spt-vpn managed peers (do not edit by hand) >>>
+# <<< spt-vpn managed peers <<<

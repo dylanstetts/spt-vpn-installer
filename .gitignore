@@ -1,0 +1,10 @@
+# Build inputs we don't track
+client/7zr.exe
+
+# Local config (paths + URL cache)
+publish/publish.config.json
+publish/manifest.json
+publish/manifest.local.json
+
+# Logs
+*.log

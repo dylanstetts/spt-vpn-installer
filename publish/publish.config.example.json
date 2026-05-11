@@ -1,0 +1,11 @@
+{
+  "spt_root": "C:\\SPT",
+  "ssh_target": "azureuser@20.115.55.17",
+  "ssh_key": null,
+  "remote_manifest_path": "/etc/spt-vpn/manifest.json",
+  "server_vpn_ip": "10.8.0.2",
+  "spt_url": "https://10.8.0.2:6969",
+  "spt_release_url": "",
+  "fika_release_url": "",
+  "mod_urls": {}
+}
