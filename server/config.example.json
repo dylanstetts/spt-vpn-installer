@@ -2,6 +2,7 @@
   "endpoint": "20.115.55.17:51820",
   "server_pubkey": "qC1bXOAt/xDmILTVrVyEhXinMI87OneKvkgZLUaZHG4=",
   "server_vpn_ip": "10.8.0.1",
+  "spt_host_vpn_ip": "10.8.0.2",
   "pool_cidr": "10.8.0.0/24",
   "client_allowed_ips": "10.8.0.2/32",
   "reserved_ips": ["10.8.0.1", "10.8.0.2", "10.8.0.3"],

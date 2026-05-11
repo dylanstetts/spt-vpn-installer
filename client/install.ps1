@@ -157,7 +157,7 @@ $p = Start-Process -FilePath $WgExe `
 if ($p.ExitCode -ne 0) { throw "wireguard /installtunnelservice exit $($p.ExitCode)" }
 
 Log "Waiting up to 30s for tunnel to come up..."
-$sptIp = $enroll.server_vpn_ip
+$sptIp = $enroll.spt_host_vpn_ip
 if (-not $sptIp) { $sptIp = $SptHostVpnIp }
 $ok = $false
 for ($i = 0; $i -lt 30; $i++) {

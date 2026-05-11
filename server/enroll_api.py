@@ -182,6 +182,7 @@ def enroll() -> Any:
         _save_invites(invites)
         _rewrite_wg_conf(invites)
 
+    spt_host = cfg.get("spt_host_vpn_ip") or cfg["server_vpn_ip"]
     return jsonify(
         address=record["address"],
         server_pubkey=cfg["server_pubkey"],
@@ -189,7 +190,8 @@ def enroll() -> Any:
         allowed_ips=cfg["client_allowed_ips"],
         dns=cfg.get("dns"),
         server_vpn_ip=cfg["server_vpn_ip"],
-        spt_url=f"https://{cfg['server_vpn_ip']}:6969",
+        spt_host_vpn_ip=spt_host,
+        spt_url=f"https://{spt_host}:6969",
     )
 
 
