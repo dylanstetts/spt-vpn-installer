@@ -127,6 +127,11 @@ Environment=ENROLL_INVITES=$CONF_DIR/invites.json
 Environment=MANIFEST_PATH=$CONF_DIR/manifest.json
 Environment=WG_CONF=$WG_CONF
 WorkingDirectory=$APP_DIR
+# Re-assert wg0.conf perms on every start. wg-quick or manual edits can
+# reset it to root:root 0600, which would break the spt-vpn user's read.
+PermissionsStartOnly=true
+ExecStartPre=/bin/chgrp spt-vpn $WG_CONF
+ExecStartPre=/bin/chmod 0660 $WG_CONF
 ExecStart=$APP_DIR/venv/bin/waitress-serve --listen=127.0.0.1:8765 enroll_api:app
 Restart=on-failure
 NoNewPrivileges=true
