@@ -109,10 +109,26 @@ Log "Public key: $pubKey"
 $hostName = ($env:COMPUTERNAME).ToLower()
 $body = @{ pubkey = $pubKey; name = $hostName } | ConvertTo-Json -Compress
 Log "Enrolling at $EnrollUrl/enroll as '$hostName'..."
-$enroll = Invoke-RestMethod `
-    -Uri "$EnrollUrl/enroll" -Method POST `
-    -Headers @{ Authorization = "Bearer $InviteToken" } `
-    -ContentType 'application/json' -Body $body
+try {
+    $enroll = Invoke-RestMethod `
+        -Uri "$EnrollUrl/enroll" -Method POST `
+        -Headers @{ Authorization = "Bearer $InviteToken" } `
+        -ContentType 'application/json' -Body $body
+} catch {
+    $msg = $_.Exception.Message
+    $inner = $_.Exception.InnerException
+    while ($inner) {
+        $msg += " | $($inner.GetType().Name): $($inner.Message)"
+        $inner = $inner.InnerException
+    }
+    if ($_.Exception.Response) {
+        try {
+            $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $msg += " | HTTP body: $($sr.ReadToEnd())"
+        } catch {}
+    }
+    throw "Enrollment failed: $msg"
+}
 Log "Assigned address: $($enroll.address)  SPT URL: $($enroll.spt_url)"
 
 # --- 3. Tunnel config + service --------------------------------------------

@@ -21,9 +21,13 @@ if ($norm.Length -ne 64 -or $norm -notmatch '^[0-9a-f]{64}$') {
     throw "Pin '$Fingerprint' is not a 64-char hex SHA256."
 }
 
-# TLS 1.2/1.3
-[Net.ServicePointManager]::SecurityProtocol =
-    [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# TLS 1.2 only.
+#
+# TLS 1.3 on Windows Schannel is brittle with self-signed certs - the
+# handshake can fail with "The underlying connection was closed: An
+# unexpected error occurred on a send" before our ServerCertificateValidationCallback
+# is even consulted. Sticking to 1.2 makes the pinning path reliable.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Inject a global validator. The expected fingerprint is captured in a
 # script-scope variable so the callback can read it.
