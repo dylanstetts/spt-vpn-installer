@@ -16,7 +16,7 @@
 ; via #define.
 
 #define MyAppName "SPT-VPN Setup"
-#define MyAppVersion "0.4.3"
+#define MyAppVersion "0.5.0"
 #define MyAppPublisher "Self-hosted SPT"
 
 ; -------- BUILD-TIME CONFIG (override on the ISCC command line) ------------

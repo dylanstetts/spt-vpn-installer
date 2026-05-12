@@ -83,6 +83,49 @@ function Get-ProductVersion([string]$Path) {
     return (Get-Item $Path).VersionInfo.ProductVersion
 }
 
+function Test-ModSource {
+    # Validates a manifest source. $Source is either:
+    #   @{ github = @{ repo = 'owner/repo'; tag = 'latest'; asset_pattern = '...' } }
+    # or
+    #   @{ url = 'https://...' }
+    # Returns @{ ok = $bool; reason = '...' }
+    param($Source)
+    if ($Source.github) {
+        $repo = $Source.github.repo
+        $tag  = if ($Source.github.tag) { [string]$Source.github.tag } else { 'latest' }
+        if ($tag -eq 'latest') {
+            $api = "https://api.github.com/repos/$repo/releases/latest"
+        } else {
+            $api = "https://api.github.com/repos/$repo/releases/tags/$tag"
+        }
+        try {
+            $rel = Invoke-RestMethod -Uri $api -TimeoutSec 30 `
+                -UserAgent 'spt-vpn-publisher' `
+                -Headers @{ 'Accept' = 'application/vnd.github+json' }
+        } catch {
+            return @{ ok = $false; reason = "GitHub API $repo@$tag failed: $($_.Exception.Message)" }
+        }
+        $assets = @($rel.assets)
+        if ($Source.github.asset_pattern) {
+            $rx = [regex]::new($Source.github.asset_pattern, 'IgnoreCase')
+            $matches = @($assets | Where-Object { $rx.IsMatch($_.name) })
+        } else {
+            $matches = @($assets | Where-Object { $_.name -match '\.(zip|7z)$' })
+        }
+        if (-not $matches) {
+            $names = ($assets | ForEach-Object { $_.name }) -join ', '
+            return @{ ok = $false; reason = "no .zip/.7z asset in $repo@$($rel.tag_name); assets: $names" }
+        }
+        if ($matches.Count -gt 1) {
+            $names = ($matches | ForEach-Object { $_.name }) -join ', '
+            return @{ ok = $false; reason = "multiple assets match in $repo@$($rel.tag_name): $names; add asset_pattern regex" }
+        }
+        return @{ ok = $true; reason = "$repo@$($rel.tag_name) -> $($matches[0].name) ($([math]::Round($matches[0].size/1KB,1)) KB)" }
+    }
+    # Legacy direct-URL path.
+    return Test-ModUrl $Source.url
+}
+
 function Test-ModUrl([string]$Url) {
     # Returns @{ ok = $bool; reason = '...' }
     try {
@@ -106,6 +149,28 @@ function Test-ModUrl([string]$Url) {
         return @{ ok = $false; reason = "Content-Length=$clen (<1 KB)" }
     }
     return @{ ok = $true; reason = "ok ($ct, $clen bytes)" }
+}
+
+function Ask-ModSource([string]$ModName, [string]$HintPath) {
+    if ($NonInteractive) {
+        throw "No source cached for '$ModName' and -NonInteractive is set. Add it to publish.config.json -> mod_sources."
+    }
+    Write-Host ""
+    Write-Host "===> Source needed for mod: $ModName" -ForegroundColor Yellow
+    Write-Host "     Local path: $HintPath"
+    Write-Host "     Enter ONE of:"
+    Write-Host "       - GitHub repo as 'owner/repo' (preferred; client auto-resolves latest release)"
+    Write-Host "       - A full https:// URL pointing directly at a .zip / .7z"
+    $ans = (Read-Host "Source").Trim()
+    if (-not $ans) { return $null }
+    if ($ans -match '^https?://') {
+        return @{ url = $ans }
+    }
+    if ($ans -match '^[\w.-]+/[\w.-]+$') {
+        return @{ github = @{ repo = $ans } }
+    }
+    Write-Host "  unrecognised - expected 'owner/repo' or https://... ; got '$ans'" -ForegroundColor Red
+    return $null
 }
 
 function Ask-ModUrl([string]$ModName, [string]$HintPath) {
@@ -190,22 +255,53 @@ if (-not $mods) {
     Write-Host "No mods to publish (nothing in fika.jsonc client.mods)." -ForegroundColor Yellow
 }
 
-# --- Resolve URLs + HEAD-probe ---------------------------------------------
+# --- Resolve sources + probe -----------------------------------------------
+# mod_sources schema in publish.config.json:
+#   { "<modname>": { "github": { "repo": "owner/repo", ... } } }
+#  or
+#   { "<modname>": { "url": "https://..." } }
+# Legacy mod_urls map (string -> url) is still honoured for back-compat.
+if (-not ($cfg.PSObject.Properties.Name -contains 'mod_sources') -or $null -eq $cfg.mod_sources) {
+    $cfg | Add-Member -NotePropertyName mod_sources -NotePropertyValue ([pscustomobject]@{}) -Force
+}
 if (-not ($cfg.PSObject.Properties.Name -contains 'mod_urls') -or $null -eq $cfg.mod_urls) {
     $cfg | Add-Member -NotePropertyName mod_urls -NotePropertyValue ([pscustomobject]@{}) -Force
 }
 
-function Get-CachedUrl($modName) {
+function Get-CachedSource($modName) {
+    if ($cfg.mod_sources.PSObject.Properties.Name -contains $modName) {
+        $raw = $cfg.mod_sources.$modName
+        # Convert PSCustomObject -> hashtable so downstream property access is uniform.
+        $h = @{}
+        if ($raw.PSObject.Properties.Name -contains 'github') {
+            $gh = @{ repo = [string]$raw.github.repo }
+            if ($raw.github.PSObject.Properties.Name -contains 'tag')           { $gh.tag = [string]$raw.github.tag }
+            if ($raw.github.PSObject.Properties.Name -contains 'asset_pattern') { $gh.asset_pattern = [string]$raw.github.asset_pattern }
+            $h.github = $gh
+        }
+        if ($raw.PSObject.Properties.Name -contains 'url') { $h.url = [string]$raw.url }
+        return $h
+    }
+    # Fallback to legacy mod_urls map.
     if ($cfg.mod_urls.PSObject.Properties.Name -contains $modName) {
-        return [string]$cfg.mod_urls.$modName
+        return @{ url = [string]$cfg.mod_urls.$modName }
     }
     return $null
 }
-function Set-CachedUrl($modName, $url) {
-    if ($cfg.mod_urls.PSObject.Properties.Name -contains $modName) {
-        $cfg.mod_urls.$modName = $url
+function Set-CachedSource($modName, $source) {
+    $payload = [ordered]@{}
+    if ($source.github) {
+        $gh = [ordered]@{ repo = $source.github.repo }
+        if ($source.github.tag)           { $gh.tag = $source.github.tag }
+        if ($source.github.asset_pattern) { $gh.asset_pattern = $source.github.asset_pattern }
+        $payload.github = [pscustomobject]$gh
+    }
+    if ($source.url) { $payload.url = $source.url }
+    $obj = [pscustomobject]$payload
+    if ($cfg.mod_sources.PSObject.Properties.Name -contains $modName) {
+        $cfg.mod_sources.$modName = $obj
     } else {
-        $cfg.mod_urls | Add-Member -NotePropertyName $modName -NotePropertyValue $url
+        $cfg.mod_sources | Add-Member -NotePropertyName $modName -NotePropertyValue $obj
     }
     $script:cfgDirty = $true
 }
@@ -215,24 +311,24 @@ $manifestOptional = @()
 $failures = @()
 
 foreach ($m in $mods) {
-    $url = Get-CachedUrl $m.Name
-    if (-not $url) {
-        $url = Ask-ModUrl $m.Name $m.Path
-        if (-not $url) {
-            $failures += "no URL provided for $($m.Name)"
+    $src = Get-CachedSource $m.Name
+    if (-not $src) {
+        $src = Ask-ModSource $m.Name $m.Path
+        if (-not $src) {
+            $failures += "no source provided for $($m.Name)"
             continue
         }
-        Set-CachedUrl $m.Name $url
+        Set-CachedSource $m.Name $src
     }
 
     Write-Host "Probing: $($m.Name)" -NoNewline
-    $probe = Test-ModUrl $url
+    $probe = Test-ModSource $src
     if ($probe.ok) {
         Write-Host "  [OK] $($probe.reason)" -ForegroundColor Green
     } else {
         Write-Host "  [FAIL] $($probe.reason)" -ForegroundColor Red
         if ($m.Required) {
-            $failures += "$($m.Name): $($probe.reason)  -- URL: $url"
+            $failures += "$($m.Name): $($probe.reason)"
             continue
         } else {
             Write-Host "  (optional - keeping in manifest; client will use fallback)" -ForegroundColor DarkYellow
@@ -240,11 +336,15 @@ foreach ($m in $mods) {
     }
 
     $sha = Get-FolderSha256 $m.Path
-    $entry = [ordered]@{
-        name       = $m.Name
-        url        = $url
-        install_to = $m.InstallTo
+    $entry = [ordered]@{ name = $m.Name }
+    if ($src.github) {
+        $gh = [ordered]@{ repo = $src.github.repo }
+        if ($src.github.tag)           { $gh.tag = $src.github.tag }
+        if ($src.github.asset_pattern) { $gh.asset_pattern = $src.github.asset_pattern }
+        $entry.github = [pscustomobject]$gh
     }
+    if ($src.url) { $entry.url = $src.url }
+    $entry.install_to = $m.InstallTo
     if ($sha) { $entry.sha256_source = $sha }  # purely informational
 
     if ($m.Required) { $manifestRequired += $entry } else { $manifestOptional += $entry }
@@ -252,12 +352,11 @@ foreach ($m in $mods) {
 
 if ($failures) {
     Write-Host ""
-    Write-Host "Publish aborted - fix these required URLs:" -ForegroundColor Red
+    Write-Host "Publish aborted - fix these required sources:" -ForegroundColor Red
     $failures | ForEach-Object { Write-Host "  * $_" }
     if ($cfgDirty -and -not $WhatIf) {
-        Get-Content -Raw $ConfigPath | Out-Null  # touch
         $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $ConfigPath -Encoding UTF8
-        Write-Host "  (cached new URLs in $ConfigPath)"
+        Write-Host "  (cached new sources in $ConfigPath)"
     }
     exit 1
 }
@@ -302,7 +401,7 @@ if ($WhatIf) {
 Set-Content -Path $localOut -Value $manifestJson -Encoding UTF8
 if ($cfgDirty) {
     $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $ConfigPath -Encoding UTF8
-    Write-Host "Cached new mod URLs in $ConfigPath."
+    Write-Host "Cached new mod sources in $ConfigPath."
 }
 Write-Host "Wrote $localOut"
 

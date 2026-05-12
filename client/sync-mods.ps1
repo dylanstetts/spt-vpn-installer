@@ -11,10 +11,19 @@
     Manifest schema (each entry):
         {
           "name": "DrakiaXYZ-BigBrain",
-          "url":  "https://hub.sp-tarkov.com/files/file/.../mod.zip",
-          "sha256": "abc..." (optional),
-          "install_to": "BepInEx/plugins"   // or "SPT/user/mods"
+          "github": {                      // preferred source
+             "repo":          "owner/repo",
+             "tag":           "latest",   // optional; default 'latest'
+             "asset_pattern": "\\.zip$"  // optional regex; default = first .zip/.7z
+          },
+          "url": "https://example.com/mod.7z",   // fallback if no 'github'
+          "sha256": "abc..."                     // optional
+          "install_to": "BepInEx/plugins"        // legacy fallback only
         }
+
+    The client resolves 'github' to a concrete asset download URL at
+    sync time via the GitHub releases API (no auth required for public
+    repos).
 
     Archives are detected by magic bytes:
         zip : 50 4B 03 04
@@ -59,6 +68,62 @@ function Get-MagicKind([string]$path) {
 
 function Get-Sha256([string]$path) {
     (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLowerInvariant()
+}
+
+# Resolve a manifest 'github' block to a concrete asset download URL.
+# Throws on any failure (no asset found, multiple matches, API error).
+function Resolve-GithubAsset {
+    param($Gh)
+
+    if (-not $Gh.repo) { throw "manifest github block missing 'repo'" }
+    $tag = if ($Gh.tag) { [string]$Gh.tag } else { 'latest' }
+    if ($tag -eq 'latest') {
+        $apiUrl = "https://api.github.com/repos/$($Gh.repo)/releases/latest"
+    } else {
+        $apiUrl = "https://api.github.com/repos/$($Gh.repo)/releases/tags/$tag"
+    }
+
+    # GitHub api.github.com uses real Internet PKI - drop the cert-pin
+    # callback for this call.
+    $savedCb = [Net.ServicePointManager]::ServerCertificateValidationCallback
+    [Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+    try {
+        # GitHub requires a User-Agent; recommend the repo so they can
+        # contact us if we ever get rate-limited.
+        $rel = Invoke-RestMethod -Uri $apiUrl -TimeoutSec 30 `
+            -UserAgent 'spt-vpn-installer (+https://github.com/dylanstetts/spt-vpn-installer)' `
+            -Headers @{ 'Accept' = 'application/vnd.github+json' }
+    } finally {
+        [Net.ServicePointManager]::ServerCertificateValidationCallback = $savedCb
+    }
+
+    $assets = @($rel.assets)
+    if (-not $assets) { throw "GitHub release $($Gh.repo)@$tag has no assets" }
+
+    if ($Gh.asset_pattern) {
+        $rx = [regex]::new($Gh.asset_pattern, 'IgnoreCase')
+        $matches = @($assets | Where-Object { $rx.IsMatch($_.name) })
+    } else {
+        # Default: any .zip or .7z asset.
+        $matches = @($assets | Where-Object { $_.name -match '\.(zip|7z)$' })
+    }
+
+    if (-not $matches) {
+        $names = ($assets | ForEach-Object { $_.name }) -join ', '
+        throw "No .zip/.7z asset matched in $($Gh.repo)@$($rel.tag_name). Assets: $names"
+    }
+    if ($matches.Count -gt 1) {
+        $names = ($matches | ForEach-Object { $_.name }) -join ', '
+        throw "Multiple assets matched in $($Gh.repo)@$($rel.tag_name): $names. Add an 'asset_pattern' regex to the manifest to disambiguate."
+    }
+
+    $a = $matches[0]
+    Log "  resolved $($Gh.repo)@$($rel.tag_name) -> $($a.name) ($([math]::Round($a.size/1KB,1)) KB)"
+    return [pscustomobject]@{
+        Url     = [string]$a.browser_download_url
+        Tag     = [string]$rel.tag_name
+        Asset   = [string]$a.name
+    }
 }
 
 function Invoke-ManualFallback {
@@ -114,11 +179,15 @@ function Expand-ModArchive {
     }
 }
 
-# Returns the directory inside $Root that is the "effective" archive root:
-# if $Root contains exactly one entry and it's a directory, descend into it
-# (handles archives wrapped in a single top-level folder). Otherwise return
-# $Root itself.
+# Returns the directory inside $Root that is the "effective" archive root.
+# If a BepInEx/ or user/ folder already exists directly under $Root, $Root
+# IS the effective root and we must NOT descend. Otherwise, if $Root
+# contains exactly one entry and it's a directory, descend into it (handles
+# archives wrapped in a single top-level folder).
 function Get-EffectiveArchiveRoot([string]$Root) {
+    if ((Get-ChildDir $Root 'BepInEx') -or (Get-ChildDir $Root 'user')) {
+        return $Root
+    }
     $entries = Get-ChildItem -LiteralPath $Root
     if ($entries.Count -eq 1 -and $entries[0].PSIsContainer) {
         return $entries[0].FullName
@@ -154,24 +223,40 @@ function Install-Mod {
     param($Entry, [string]$InstallDir, [string]$WorkDir, [bool]$Required)
 
     $name      = $Entry.name
-    $url       = $Entry.url
     $installTo = if ($Entry.install_to) { $Entry.install_to } else { 'BepInEx/plugins' }
     $targetDir = Join-Path $InstallDir ($installTo -replace '/', '\')
+
+    # Resolve download URL: prefer 'github' block, fall back to literal 'url'.
+    $url = $null
+    if ($Entry.github -and $Entry.github.repo) {
+        try {
+            $resolved = Resolve-GithubAsset $Entry.github
+            $url      = $resolved.Url
+        } catch {
+            $msg = "GitHub asset resolution failed for '$name': $($_.Exception.Message)"
+            if ($Required) { throw $msg } else { Log "WARN: $msg"; return }
+        }
+    } elseif ($Entry.url) {
+        $url = [string]$Entry.url
+    }
 
     Log "Installing $name (required=$Required) -> $installTo (fallback)"
 
     if (-not $url) {
-        $msg = "Mod '$name' has no URL in the manifest."
+        $msg = "Mod '$name' has no 'github' or 'url' in the manifest."
         if ($Required) { throw $msg } else { Log "WARN: $msg"; return }
     }
 
     # Step 1: download attempt (no pinning - public internet).
     $savedCallback = [Net.ServicePointManager]::ServerCertificateValidationCallback
     [Net.ServicePointManager]::ServerCertificateValidationCallback = $null
-    $dl = Join-Path $WorkDir "$name.download"
-    if (Test-Path $dl) { Remove-Item -Force $dl }
+    # Download to a tempfile without an extension first, then rename based
+    # on detected magic bytes. Expand-Archive rejects files whose extension
+    # isn't .zip even if the bytes are zip.
+    $dlTmp = Join-Path $WorkDir "$name.download"
+    if (Test-Path $dlTmp) { Remove-Item -Force $dlTmp }
     try {
-        Invoke-WebRequest -Uri $url -OutFile $dl -UseBasicParsing `
+        Invoke-WebRequest -Uri $url -OutFile $dlTmp -UseBasicParsing `
             -UserAgent 'Mozilla/5.0 spt-vpn-installer'
     } catch {
         Log "WARN: download failed for $name : $($_.Exception.Message)"
@@ -180,7 +265,7 @@ function Install-Mod {
     }
 
     # Step 2: magic-byte sniff
-    $kind = if (Test-Path $dl) { Get-MagicKind $dl } else { 'unknown' }
+    $kind = if (Test-Path $dlTmp) { Get-MagicKind $dlTmp } else { 'unknown' }
 
     # Step 3: manual fallback if needed
     if ($kind -eq 'unknown') {
@@ -191,13 +276,18 @@ function Install-Mod {
             $msg = "No file placed in $manualDir for mod '$name'."
             if ($Required) { throw $msg } else { Log "WARN: $msg"; return }
         }
-        Copy-Item -Force $picked $dl
-        $kind = Get-MagicKind $dl
+        Copy-Item -Force $picked $dlTmp
+        $kind = Get-MagicKind $dlTmp
         if ($kind -eq 'unknown') {
             $msg = "File placed for '$name' is not a valid .zip / .7z archive."
             if ($Required) { throw $msg } else { Log "WARN: $msg"; return }
         }
     }
+
+    # Rename download to a real extension so Expand-Archive accepts it.
+    $dl = Join-Path $WorkDir "$name.$kind"
+    if (Test-Path $dl) { Remove-Item -Force $dl }
+    Move-Item -LiteralPath $dlTmp -Destination $dl
 
     # Step 4: optional SHA256 check
     if ($Entry.sha256) {

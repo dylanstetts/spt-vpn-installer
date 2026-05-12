@@ -7,5 +7,10 @@
   "spt_url": "https://10.8.0.2:6969",
   "spt_release_url": "",
   "fika_release_url": "",
-  "mod_urls": {}
+  "mod_urls": {},
+  "mod_sources": {
+    "ExampleGitHubMod":     { "github": { "repo": "owner/repo" } },
+    "ExamplePinnedTagMod":  { "github": { "repo": "owner/repo", "tag": "v1.2.3", "asset_pattern": "client.*\\.zip$" } },
+    "ExampleDirectUrlMod":  { "url": "https://example.com/mods/example-1.0.7z" }
+  }
 }
