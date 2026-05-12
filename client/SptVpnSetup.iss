@@ -5,16 +5,18 @@
 ; Produces: dist\SptVpnSetup.exe
 ;
 ; The installer:
-;   1. Checks for a legit EFT install (registry + filesystem heuristics).
-;   2. Asks for the SPT install directory and the invite token.
-;   3. Stages install.ps1 + sync-mods.ps1 + _pin.ps1 + 7zr.exe in {tmp}.
-;   4. Runs install.ps1 elevated.
+;   1. Auto-detects EFT and any existing SPT install.
+;   2. Asks for setup mode (first-time install vs custom component pick).
+;   3. Asks for the SPT install directory (default = autodetected or
+;      {autopf}\SPT) and, if VPN/Mods are selected, the invite token.
+;   4. Stages install.ps1 + sync-mods.ps1 + _pin.ps1 + 7zr.exe in {tmp}.
+;   5. Runs install.ps1 elevated with -Components flag.
 ;
 ; The enrollment URL + pinned cert fingerprint are baked in at build time
 ; via #define.
 
 #define MyAppName "SPT-VPN Setup"
-#define MyAppVersion "0.2.1"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "Self-hosted SPT"
 
 ; -------- BUILD-TIME CONFIG (override on the ISCC command line) ------------
@@ -32,7 +34,7 @@
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={autopf}\SPT
+DefaultDirName={code:DefaultInstallDir}
 DefaultGroupName=SPT
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
@@ -56,9 +58,12 @@ Source: "7zr.exe";       DestDir: "{tmp}"; Flags: dontcopy skipifsourcedoesntexi
 
 [Code]
 var
-  EftWarnPage: TOutputMsgWizardPage;
-  TokenPage:   TInputQueryWizardPage;
-  HasEft:      Boolean;
+  EftWarnPage:     TOutputMsgWizardPage;
+  ModeSelectPage:  TInputOptionWizardPage;
+  ComponentsPage:  TInputOptionWizardPage;
+  TokenPage:       TInputQueryWizardPage;
+  HasEft:          Boolean;
+  AutodetectedSpt: String;
 
 function TryRegPath(RootKey: Integer; const SubKey, ValueName: String; var Path: String): Boolean;
 var
@@ -76,6 +81,51 @@ begin
   Result := (P <> '') and DirExists(P) and
             (FileExists(AddBackslash(P) + 'EscapeFromTarkov.exe') or
              DirExists(AddBackslash(P) + 'EscapeFromTarkov_Data'));
+end;
+
+function LooksLikeSptFolder(const P: String): Boolean;
+var
+  B: String;
+begin
+  Result := False;
+  if (P = '') or (not DirExists(P)) then Exit;
+  B := AddBackslash(P);
+  // SPT.Launcher.exe at root or under \SPT\
+  if not (FileExists(B + 'SPT.Launcher.exe') or
+          FileExists(B + 'SPT\SPT.Launcher.exe')) then Exit;
+  // BepInEx folder at root or under \SPT\
+  if not (DirExists(B + 'BepInEx') or
+          DirExists(B + 'SPT\BepInEx')) then Exit;
+  // mods directory somewhere reasonable
+  if (DirExists(B + 'user\mods') or
+      DirExists(B + 'SPT\user\mods') or
+      DirExists(B + 'BepInEx\plugins')) then
+    Result := True;
+end;
+
+function FindSptInstall(): String;
+var
+  DriveIdx, i: Integer;
+  Subdirs: TArrayOfString;
+  Candidate: String;
+begin
+  Result := '';
+  SetArrayLength(Subdirs, 6);
+  Subdirs[0] := 'SPT';
+  Subdirs[1] := 'SPT-AKI';
+  Subdirs[2] := 'Games\SPT';
+  Subdirs[3] := 'Program Files\SPT';
+  Subdirs[4] := 'Program Files (x86)\SPT';
+  Subdirs[5] := 'SPTarkov';
+  for DriveIdx := Ord('C') to Ord('Z') do begin
+    for i := 0 to GetArrayLength(Subdirs) - 1 do begin
+      Candidate := Chr(DriveIdx) + ':\' + Subdirs[i];
+      if LooksLikeSptFolder(Candidate) then begin
+        Result := Candidate;
+        Exit;
+      end;
+    end;
+  end;
 end;
 
 function FindEftInstall(): String;
@@ -122,10 +172,59 @@ begin
   end;
 end;
 
+// {code:DefaultInstallDir} - used by DefaultDirName.
+function DefaultInstallDir(Param: String): String;
+begin
+  if AutodetectedSpt <> '' then
+    Result := AutodetectedSpt
+  else
+    Result := ExpandConstant('{autopf}') + '\SPT';
+end;
+
+function ModeFirstTime(): Boolean;
+begin
+  Result := (ModeSelectPage <> nil) and (ModeSelectPage.SelectedValueIndex = 0);
+end;
+
+function HasComponent(const Name: String): Boolean;
+begin
+  Result := False;
+  if ComponentsPage = nil then Exit;
+  if ModeFirstTime() then begin
+    Result := True;
+    Exit;
+  end;
+  if Name = 'VPN'  then Result := ComponentsPage.Values[0];
+  if Name = 'SPT'  then Result := ComponentsPage.Values[1];
+  if Name = 'Fika' then Result := ComponentsPage.Values[2];
+  if Name = 'Mods' then Result := ComponentsPage.Values[3];
+end;
+
+function NeedsToken(): Boolean;
+begin
+  Result := HasComponent('VPN') or HasComponent('Mods');
+end;
+
+function GetSelectedComponents(): String;
+var
+  Parts: String;
+begin
+  Parts := '';
+  if HasComponent('VPN')  then Parts := Parts + 'VPN,';
+  if HasComponent('SPT')  then Parts := Parts + 'SPT,';
+  if HasComponent('Fika') then Parts := Parts + 'Fika,';
+  if HasComponent('Mods') then Parts := Parts + 'Mods,';
+  if Length(Parts) > 0 then
+    Parts := Copy(Parts, 1, Length(Parts) - 1);
+  Result := Parts;
+end;
+
 procedure InitializeWizard;
 var
   EftPath: String;
 begin
+  AutodetectedSpt := FindSptInstall();
+
   EftPath := FindEftInstall();
   HasEft := EftPath <> '';
 
@@ -137,18 +236,56 @@ begin
       'and cannot work without it. No EFT files are downloaded from the server.'#13#10#13#10 +
       'Setup looked in the usual registry keys and common install paths but found nothing.'#13#10#13#10 +
       'If you DO have EFT installed (e.g. in a non-standard folder, or the BSG launcher has never been ' +
-      'run on this account), you can continue anyway - the Fika-Installer that runs next will ask you ' +
+      'run on this account), you can continue anyway - the SPT/Fika installers that run later will ask you ' +
       'to point at your EFT folder.'#13#10#13#10 +
       'Click Next to continue. If you genuinely don''t have EFT installed, Cancel and install it first via:'#13#10 +
       '    https://www.escapefromtarkov.com/launcher');
   end;
 
+  // Setup mode page (first-time install vs custom).
+  ModeSelectPage := CreateInputOptionPage(wpWelcome,
+    'Setup mode',
+    'Choose how much of the SPT + Fika + VPN stack to install',
+    'Pick "First-time install" to run everything: WireGuard VPN, SPT, Fika, and mod sync. ' +
+    'Pick "Custom" to choose individual components on the next page.',
+    True, False);
+  ModeSelectPage.Add('&First-time install (VPN + SPT + Fika + Mods)');
+  ModeSelectPage.Add('&Custom (choose components)');
+  ModeSelectPage.SelectedValueIndex := 0;
+
+  // Component selection page (only used when "Custom" mode is chosen).
+  ComponentsPage := CreateInputOptionPage(ModeSelectPage.ID,
+    'Choose components',
+    'Select which components to install',
+    'Tick any combination. Fika requires a valid SPT installation (existing or being installed now); ' +
+    'mod sync requires the VPN invite token. The SPT folder is configured on the next page.',
+    False, False);
+  ComponentsPage.Add('&VPN  (WireGuard tunnel + enrollment)');
+  ComponentsPage.Add('&SPT  (download + run SPTInstaller.exe)');
+  ComponentsPage.Add('Fi&ka (run Fika-Installer.exe)');
+  ComponentsPage.Add('&Mods (sync mods from server manifest)');
+  ComponentsPage.Values[0] := True;
+  ComponentsPage.Values[1] := True;
+  ComponentsPage.Values[2] := True;
+  ComponentsPage.Values[3] := True;
+
   TokenPage := CreateInputQueryPage(wpSelectDir,
     'Server invite',
     'Enter the invite token your server admin gave you',
     'This token enrolls your machine on the SPT VPN. It is single-use ' +
-    'and tied to this computer.');
+    'and tied to this computer. Not required if you only selected SPT/Fika.');
   TokenPage.Add('Invite token:', False);
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  // Skip per-component page in first-time mode.
+  if (ComponentsPage <> nil) and (PageID = ComponentsPage.ID) and ModeFirstTime() then
+    Result := True;
+  // Skip token page if neither VPN nor Mods are selected.
+  if (TokenPage <> nil) and (PageID = TokenPage.ID) and (not NeedsToken()) then
+    Result := True;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -156,16 +293,34 @@ begin
   Result := True;
   if (EftWarnPage <> nil) and (CurPageID = EftWarnPage.ID) and (not HasEft) then begin
     if MsgBox('EFT was not auto-detected. Continue anyway?' + #13#10 + #13#10 +
-              'Choose Yes only if you''re certain EFT is installed. The Fika-Installer will prompt you ' +
+              'Choose Yes only if you''re certain EFT is installed. The SPT/Fika installers will prompt you ' +
               'to point at your EFT folder.',
               mbConfirmation, MB_YESNO) = IDNO then begin
       Result := False;
       Exit;
     end;
   end;
-  if CurPageID = TokenPage.ID then begin
+  if (ComponentsPage <> nil) and (CurPageID = ComponentsPage.ID) then begin
+    if (not HasComponent('VPN')) and (not HasComponent('SPT')) and
+       (not HasComponent('Fika')) and (not HasComponent('Mods')) then begin
+      MsgBox('Select at least one component.', mbError, MB_OK);
+      Result := False;
+      Exit;
+    end;
+    if HasComponent('Fika') and (not HasComponent('SPT')) and
+       (not LooksLikeSptFolder(WizardDirValue())) then begin
+      if MsgBox('Fika is selected but SPT is not, and no valid SPT installation was found at:' + #13#10 +
+                '    ' + WizardDirValue() + #13#10 + #13#10 +
+                'Fika install will fail without SPT. Continue anyway?',
+                mbConfirmation, MB_YESNO) = IDNO then begin
+        Result := False;
+        Exit;
+      end;
+    end;
+  end;
+  if (TokenPage <> nil) and (CurPageID = TokenPage.ID) and NeedsToken() then begin
     if Trim(TokenPage.Values[0]) = '' then begin
-      MsgBox('Please paste the invite token.', mbError, MB_OK);
+      MsgBox('Please paste the invite token (required for VPN and Mods).', mbError, MB_OK);
       Result := False;
     end;
   end;
@@ -173,12 +328,15 @@ end;
 
 function GetToken(Param: string): string;
 begin
-  Result := Trim(TokenPage.Values[0]);
+  if (TokenPage <> nil) and NeedsToken() then
+    Result := Trim(TokenPage.Values[0])
+  else
+    Result := '';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  PsScript, Cmd, Token: string;
+  PsScript, Cmd, Token, Components: string;
   ResultCode: Integer;
 begin
   if CurStep <> ssPostInstall then Exit;
@@ -192,8 +350,9 @@ begin
   except
   end;
 
-  PsScript := ExpandConstant('{tmp}\install.ps1');
-  Token    := GetToken('');
+  PsScript   := ExpandConstant('{tmp}\install.ps1');
+  Token      := GetToken('');
+  Components := GetSelectedComponents();
 
   Cmd :=
     '-NoProfile -ExecutionPolicy Bypass -File "' + PsScript + '"' +
@@ -201,6 +360,7 @@ begin
     ' -EnrollFingerprint "{#EnrollFingerprint}"' +
     ' -SptHostVpnIp "{#SptHostVpnIp}"' +
     ' -InviteToken "' + Token + '"' +
+    ' -Components "' + Components + '"' +
     ' -InstallDir "' + ExpandConstant('{app}') + '"';
 
   if not Exec('powershell.exe', Cmd, '', SW_SHOW, ewWaitUntilTerminated, ResultCode) then begin
