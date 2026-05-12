@@ -16,7 +16,7 @@
 ; via #define.
 
 #define MyAppName "SPT-VPN Setup"
-#define MyAppVersion "0.3.0"
+#define MyAppVersion "0.3.1"
 #define MyAppPublisher "Self-hosted SPT"
 
 ; -------- BUILD-TIME CONFIG (override on the ISCC command line) ------------
@@ -202,7 +202,10 @@ end;
 
 function NeedsToken(): Boolean;
 begin
-  Result := HasComponent('VPN') or HasComponent('Mods');
+  // The invite token is only meaningful for VPN enrollment. Mod sync
+  // reuses the same token when VPN is also selected; if the user picks
+  // Mods without VPN we let install.ps1 surface that as an error.
+  Result := HasComponent('VPN');
 end;
 
 function GetSelectedComponents(): String;
@@ -273,7 +276,7 @@ begin
     'Server invite',
     'Enter the invite token your server admin gave you',
     'This token enrolls your machine on the SPT VPN. It is single-use ' +
-    'and tied to this computer. Not required if you only selected SPT/Fika.');
+    'and tied to this computer. Only required when the VPN component is selected.');
   TokenPage.Add('Invite token:', False);
 end;
 
@@ -317,10 +320,19 @@ begin
         Exit;
       end;
     end;
+    if HasComponent('Mods') and (not HasComponent('VPN')) then begin
+      if MsgBox('Mods is selected but VPN is not. Mod sync requires the invite token, ' +
+                'which is only collected when VPN is selected. Without it, mod sync will fail.' + #13#10 + #13#10 +
+                'Continue anyway?',
+                mbConfirmation, MB_YESNO) = IDNO then begin
+        Result := False;
+        Exit;
+      end;
+    end;
   end;
   if (TokenPage <> nil) and (CurPageID = TokenPage.ID) and NeedsToken() then begin
     if Trim(TokenPage.Values[0]) = '' then begin
-      MsgBox('Please paste the invite token (required for VPN and Mods).', mbError, MB_OK);
+      MsgBox('Please paste the invite token (required for the VPN component).', mbError, MB_OK);
       Result := False;
     end;
   end;
