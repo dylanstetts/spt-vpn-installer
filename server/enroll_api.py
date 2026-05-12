@@ -32,6 +32,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import secrets
 import subprocess
 import threading
@@ -39,6 +40,15 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, abort, jsonify, request, send_file
+
+# WireGuard base64 pubkey: 43 base64 chars + '='. Strict charset = [A-Za-z0-9+/]
+# We reject anything containing characters that would let an attacker break
+# out of `PublicKey = <value>` into a second wg config line (the value is
+# written verbatim into wg0.conf).
+_PUBKEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+# Display name written into a `# peer name=…` comment line — strip CR/LF and
+# anything that could confuse the parser.
+_NAME_RE = re.compile(r"^[A-Za-z0-9 _.\-]{1,32}$")
 
 # --- Config ------------------------------------------------------------------
 
@@ -163,8 +173,12 @@ def enroll() -> Any:
     body = request.get_json(force=True, silent=True) or {}
     pubkey = (body.get("pubkey") or "").strip()
     name = (body.get("name") or "client").strip()[:32]
-    if len(pubkey) != 44 or not pubkey.endswith("="):
+    if not _PUBKEY_RE.match(pubkey):
         abort(400, "invalid pubkey")
+    if not _NAME_RE.match(name):
+        # Fall back to a safe default rather than rejecting outright — the
+        # name is purely cosmetic in wg0.conf comments.
+        name = "client"
 
     cfg = _config()
     with _lock:
