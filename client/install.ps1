@@ -138,6 +138,114 @@ function Test-SptInstallation {
     return $false
 }
 
+# Returns the first plausible SPT install root on this machine, or $null.
+# Scans common locations on every fixed drive. The originally requested
+# install dir is checked first.
+function Find-SptInstallation {
+    param([string]$Preferred)
+
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if ($Preferred) {
+        $candidates.Add($Preferred) | Out-Null
+        # SPTInstaller often creates a "SPT" subfolder under the chosen dir.
+        $candidates.Add((Join-Path $Preferred 'SPT')) | Out-Null
+    }
+
+    $subdirs = @(
+        'SPT', 'SPT-AKI', 'SPTarkov',
+        'Games\SPT', 'Games\SPT-AKI', 'Games\SPTarkov',
+        'Program Files\SPT', 'Program Files (x86)\SPT'
+    )
+    try {
+        $drives = [IO.DriveInfo]::GetDrives() |
+            Where-Object { $_.IsReady -and $_.DriveType -eq 'Fixed' } |
+            ForEach-Object { $_.RootDirectory.FullName }
+    } catch {
+        $drives = @('C:\')
+    }
+    foreach ($d in $drives) {
+        foreach ($s in $subdirs) {
+            $candidates.Add((Join-Path $d $s)) | Out-Null
+        }
+    }
+
+    $seen = @{}
+    foreach ($c in $candidates) {
+        $key = $c.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        if (Test-SptInstallation -Root $c) { return $c }
+    }
+    return $null
+}
+
+# Pop a folder-picker dialog asking the user to point at their SPT install.
+# Re-asks (up to $maxRetries) if the chosen path doesn't validate.
+function Read-SptInstallationPath {
+    param(
+        [string]$Initial,
+        [int]$MaxRetries = 3
+    )
+    Add-Type -AssemblyName System.Windows.Forms | Out-Null
+
+    for ($i = 0; $i -lt $MaxRetries; $i++) {
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Locate your SPT installation folder (must contain SPT.Launcher.exe and BepInEx)."
+        $dlg.ShowNewFolderButton = $false
+        if ($Initial -and (Test-Path $Initial)) { $dlg.SelectedPath = $Initial }
+
+        $res = $dlg.ShowDialog()
+        if ($res -ne [System.Windows.Forms.DialogResult]::OK) {
+            return $null
+        }
+        $picked = $dlg.SelectedPath
+        if (Test-SptInstallation -Root $picked) { return $picked }
+        # Allow user to pick the parent (e.g. C:\Games) that contains "SPT".
+        $nested = Join-Path $picked 'SPT'
+        if (Test-SptInstallation -Root $nested) { return $nested }
+
+        [System.Windows.Forms.MessageBox]::Show(
+            "'$picked' does not look like a valid SPT install.`n`n" +
+            "Expected: SPT.Launcher.exe + BepInEx\ + a mods folder (user\mods or BepInEx\plugins).`n`n" +
+            "Please try again, or Cancel to abort.",
+            "SPT install not detected",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+    }
+    return $null
+}
+
+# Resolves an SPT install root for the current run:
+#   1. Validate the requested install dir as-is.
+#   2. Auto-scan common locations.
+#   3. Prompt the user with a folder picker.
+# Returns a validated path, or throws.
+function Resolve-SptInstallationPath {
+    param(
+        [string]$Preferred,
+        [string]$ContextLabel = 'SPT'
+    )
+    if (Test-SptInstallation -Root $Preferred) {
+        return $Preferred
+    }
+    Log "Scanning for an SPT installation (preferred '$Preferred' did not validate)..."
+    $found = Find-SptInstallation -Preferred $Preferred
+    if ($found) {
+        Log "Auto-detected SPT at '$found'."
+        return $found
+    }
+    Log "No SPT install auto-detected; prompting user."
+    $picked = Read-SptInstallationPath -Initial $Preferred
+    if ($picked) {
+        Log "User-selected SPT path: '$picked'."
+        return $picked
+    }
+    throw ("Cannot locate an SPT installation for the $ContextLabel step. " +
+           "Expected SPT.Launcher.exe, BepInEx folder, and a mods directory under the install root. " +
+           "Install SPT first (re-run setup with the SPT component), or pick the correct folder when prompted.")
+}
+
 # --- Cert pinning (loaded from sibling _pin.ps1) ----------------------------
 $pin = Join-Path $PSScriptRoot '_pin.ps1'
 if (-not (Test-Path $pin)) { throw "_pin.ps1 missing alongside install.ps1." }
@@ -258,9 +366,15 @@ if (HasComponent 'VPN') {
 
 # --- 4. SPT install (SPTInstaller.exe from ligma) --------------------------
 $null = New-Item -ItemType Directory -Force -Path $InstallDir
+# $sptRoot is the validated SPT install root used by Fika/Mods/launcher
+# patching. It may differ from $InstallDir if SPTInstaller redirected
+# (e.g. user picked C:\Program Files\SPT but SPTInstaller installed to
+# C:\SPT) or if the user picked a different folder when prompted.
+$sptRoot = $null
 if (HasComponent 'SPT') {
     if (Test-SptInstallation -Root $InstallDir) {
         Log "Existing SPT installation detected at '$InstallDir' - skipping SPTInstaller."
+        $sptRoot = $InstallDir
     } else {
         $sptInstaller = Join-Path $WorkDir 'SPTInstaller.exe'
         Log "Downloading SPTInstaller.exe from $SptInstallerUrl ..."
@@ -279,13 +393,12 @@ if (HasComponent 'SPT') {
             Log "WARNING: SPTInstaller exited $($p.ExitCode)."
         }
 
-        if (-not (Test-SptInstallation -Root $InstallDir)) {
-            throw ("SPT installation validation failed at '$InstallDir'. " +
-                   "Expected SPT.Launcher.exe, BepInEx folder, and a mods directory. " +
-                   "If you installed SPT to a different location, re-run setup and " +
-                   "point it at the correct folder.")
-        }
-        Log "SPT installation validated at '$InstallDir'."
+        # SPTInstaller may install at a totally different location than the
+        # one we passed (Program Files is often blocked; users can change
+        # the destination inside the wizard). Auto-detect, then fall back
+        # to a folder picker.
+        $sptRoot = Resolve-SptInstallationPath -Preferred $InstallDir -ContextLabel 'SPT install validation'
+        Log "SPT installation validated at '$sptRoot'."
     }
 } else {
     Log "Skipping SPT install (SPT component not selected)."
@@ -293,11 +406,10 @@ if (HasComponent 'SPT') {
 
 # --- 5. Fika-Installer ------------------------------------------------------
 if (HasComponent 'Fika') {
-    if (-not (Test-SptInstallation -Root $InstallDir)) {
-        throw ("Cannot install Fika: no valid SPT installation found at '$InstallDir'. " +
-               "Run setup again with 'SPT' included, or point at an existing SPT folder.")
+    if (-not $sptRoot) {
+        $sptRoot = Resolve-SptInstallationPath -Preferred $InstallDir -ContextLabel 'Fika install'
     }
-    $fikaInstaller = Join-Path $InstallDir 'Fika-Installer.exe'
+    $fikaInstaller = Join-Path $sptRoot 'Fika-Installer.exe'
     if (-not (Test-Path $fikaInstaller)) {
         Log "Downloading Fika-Installer.exe..."
         $savedCb = [Net.ServicePointManager]::ServerCertificateValidationCallback
@@ -308,8 +420,8 @@ if (HasComponent 'Fika') {
             [Net.ServicePointManager]::ServerCertificateValidationCallback = $savedCb
         }
     }
-    Log "Launching Fika-Installer.exe (interactive wizard)..."
-    $p = Start-Process -FilePath $fikaInstaller -WorkingDirectory $InstallDir -Wait -PassThru
+    Log "Launching Fika-Installer.exe (interactive wizard) at '$sptRoot'..."
+    $p = Start-Process -FilePath $fikaInstaller -WorkingDirectory $sptRoot -Wait -PassThru
     if ($p.ExitCode -ne 0) {
         Log "WARNING: Fika-Installer exited $($p.ExitCode)."
     }
@@ -319,48 +431,65 @@ if (HasComponent 'Fika') {
 
 # --- 6. Sync mods from server manifest --------------------------------------
 if (HasComponent 'Mods') {
+    if (-not $sptRoot) {
+        $sptRoot = Resolve-SptInstallationPath -Preferred $InstallDir -ContextLabel 'mod sync'
+    }
     & "$PSScriptRoot\sync-mods.ps1" `
         -EnrollUrl         $EnrollUrl `
         -EnrollFingerprint $EnrollFingerprint `
         -InviteToken       $InviteToken `
-        -InstallDir        $InstallDir
+        -InstallDir        $sptRoot
 } else {
     Log "Skipping mod sync (Mods component not selected)."
 }
 
 # --- 7. Patch SPT launcher config -------------------------------------------
 if ((HasComponent 'VPN') -and $enroll) {
-    $launcherCfgCandidates = @(
-        (Join-Path $InstallDir 'SPT\user\launcher\config.json'),
-        (Join-Path $InstallDir 'user\launcher\config.json')
-    )
-    $launcherCfg = $launcherCfgCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-    if ($launcherCfg) {
-        Log "Patching launcher config ($launcherCfg) -> $($enroll.spt_url)"
-        $cfg = Get-Content $launcherCfg -Raw | ConvertFrom-Json
-        if (-not $cfg.Server) {
-            $cfg | Add-Member -NotePropertyName Server -NotePropertyValue ([pscustomobject]@{})
+    if (-not $sptRoot) {
+        # Best-effort detection; don't prompt if we don't have to.
+        if (Test-SptInstallation -Root $InstallDir) { $sptRoot = $InstallDir }
+        else { $sptRoot = Find-SptInstallation -Preferred $InstallDir }
+    }
+    if ($sptRoot) {
+        $launcherCfgCandidates = @(
+            (Join-Path $sptRoot 'user\launcher\config.json'),
+            (Join-Path $sptRoot 'SPT\user\launcher\config.json')
+        )
+        $launcherCfg = $launcherCfgCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($launcherCfg) {
+            Log "Patching launcher config ($launcherCfg) -> $($enroll.spt_url)"
+            $cfg = Get-Content $launcherCfg -Raw | ConvertFrom-Json
+            if (-not $cfg.Server) {
+                $cfg | Add-Member -NotePropertyName Server -NotePropertyValue ([pscustomobject]@{})
+            }
+            $cfg.Server.Url = $enroll.spt_url
+            if (-not $cfg.Server.Name) { $cfg.Server.Name = 'SPT (VPN)' }
+            $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $launcherCfg -Encoding UTF8
+        } else {
+            Log "Launcher config not found under '$sptRoot' (skipping patch)."
         }
-        $cfg.Server.Url = $enroll.spt_url
-        if (-not $cfg.Server.Name) { $cfg.Server.Name = 'SPT (VPN)' }
-        $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $launcherCfg -Encoding UTF8
     } else {
-        Log "Launcher config not found under $InstallDir (skipping patch)."
+        Log "No SPT install located; skipping launcher config patch."
     }
 }
 
 # --- 8. Diagnostics ---------------------------------------------------------
 $diag = [pscustomobject]@{
-    components   = $selected
-    address      = if ($enroll) { $enroll.address } else { $null }
-    pubkey       = $pubKey
-    enroll_url   = $EnrollUrl
-    fingerprint  = $EnrollFingerprint
-    spt_url      = if ($enroll) { $enroll.spt_url } else { $null }
-    install_dir  = $InstallDir
-    installed_at = (Get-Date).ToString('o')
+    components    = $selected
+    address       = if ($enroll) { $enroll.address } else { $null }
+    pubkey        = $pubKey
+    enroll_url    = $EnrollUrl
+    fingerprint   = $EnrollFingerprint
+    spt_url       = if ($enroll) { $enroll.spt_url } else { $null }
+    install_dir   = $InstallDir
+    spt_root      = $sptRoot
+    installed_at  = (Get-Date).ToString('o')
 }
 $diag | ConvertTo-Json | Set-Content -Path (Join-Path $LogDir 'client.json') -Encoding UTF8
 
-Log "DONE. Launch SPT.Launcher.exe from $InstallDir (or $InstallDir\SPT)."
+if ($sptRoot) {
+    Log "DONE. Launch SPT.Launcher.exe from '$sptRoot'."
+} else {
+    Log "DONE. Launch SPT.Launcher.exe from $InstallDir (or $InstallDir\SPT)."
+}
 Stop-Transcript | Out-Null
