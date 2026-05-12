@@ -114,15 +114,63 @@ function Expand-ModArchive {
     }
 }
 
+# If the archive only contains a single wrapper folder (e.g. "MyMod-1.0/"),
+# descend into it so we see the BepInEx / user layout underneath. We refuse
+# to descend if the wrapper itself looks like SPT structure (i.e. is named
+# "BepInEx" or "user") so we never strip the structural folder.
+function Find-ArchiveRoot {
+    param([string]$Staging)
+    $cur = $Staging
+    for ($i = 0; $i -lt 4; $i++) {
+        $items = @(Get-ChildItem -LiteralPath $cur -Force)
+        if ($items.Count -ne 1 -or -not $items[0].PSIsContainer) { return $cur }
+        $name = $items[0].Name.ToLowerInvariant()
+        if ($name -eq 'bepinex' -or $name -eq 'user') { return $cur }
+        $cur = $items[0].FullName
+    }
+    return $cur
+}
+
+function Get-ChildDirCI {
+    param([string]$Path, [string]$Name)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    return Get-ChildItem -LiteralPath $Path -Directory -Force |
+        Where-Object { $_.Name -ieq $Name } |
+        Select-Object -First 1
+}
+
+# Recursive copy-merge: overlays $Source onto $Dest preserving relative paths.
+# Existing files at the destination are overwritten; existing siblings are
+# left alone (i.e. it does NOT delete-then-replace mod folders).
+function Copy-Tree {
+    param([string]$Source, [string]$Dest)
+    $null = New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+    $srcFull = (Resolve-Path -LiteralPath $Source).Path.TrimEnd('\','/')
+    Get-ChildItem -LiteralPath $srcFull -Recurse -Force | ForEach-Object {
+        $rel = $_.FullName.Substring($srcFull.Length).TrimStart('\','/')
+        $target = Join-Path $Dest $rel
+        if ($_.PSIsContainer) {
+            if (-not (Test-Path -LiteralPath $target)) {
+                $null = New-Item -ItemType Directory -Force -Path $target | Out-Null
+            }
+        } else {
+            $parent = Split-Path -LiteralPath $target -Parent
+            if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                $null = New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            }
+            Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+        }
+    }
+}
+
 function Install-Mod {
     param($Entry, [string]$InstallDir, [string]$WorkDir, [bool]$Required)
 
     $name      = $Entry.name
     $url       = $Entry.url
     $installTo = if ($Entry.install_to) { $Entry.install_to } else { 'BepInEx/plugins' }
-    $targetDir = Join-Path $InstallDir ($installTo -replace '/', '\')
 
-    Log "Installing $name (required=$Required) -> $installTo"
+    Log "Installing $name (required=$Required) -> default install_to=$installTo"
 
     if (-not $url) {
         $msg = "Mod '$name' has no URL in the manifest."
@@ -172,25 +220,52 @@ function Install-Mod {
         }
     }
 
-    # Step 5: extract into a staging dir, then merge into target
+    # Step 5: extract into a staging dir, then route into SPT.
     $staging = Join-Path $WorkDir "stage_$name"
     if (Test-Path $staging) { Remove-Item -Recurse -Force $staging }
     Expand-ModArchive -ArchivePath $dl -DestDir $staging -Kind $kind
+    $root = Find-ArchiveRoot $staging
 
-    # If the archive contains a single top-level folder, use it as the
-    # mod folder. Otherwise install loose contents into a folder named
-    # after the entry.
-    $rootEntries = Get-ChildItem $staging
-    $null = New-Item -ItemType Directory -Force -Path $targetDir
-    if ($rootEntries.Count -eq 1 -and $rootEntries[0].PSIsContainer) {
-        $modFolder = Join-Path $targetDir $rootEntries[0].Name
-        if (Test-Path $modFolder) { Remove-Item -Recurse -Force $modFolder }
-        Move-Item -Path $rootEntries[0].FullName -Destination $modFolder -Force
+    # Step 6: structure detection. Many SPT mods ship a tree like:
+    #   BepInEx/plugins/<mod>/...
+    #   user/mods/<mod>/...
+    # or just one of the two. If we see either, we merge them straight into
+    # $InstallDir\BepInEx and $InstallDir\user. Otherwise we fall back to
+    # the manifest's install_to hint.
+    $bepDir  = Get-ChildDirCI -Path $root -Name 'BepInEx'
+    $userDir = Get-ChildDirCI -Path $root -Name 'user'
+
+    if ($bepDir -or $userDir) {
+        $parts = @()
+        if ($bepDir)  { $parts += 'BepInEx' }
+        if ($userDir) { $parts += 'user' }
+        Log "Detected SPT layout in archive for $name : $($parts -join ' + '). Merging into install root."
+
+        if ($bepDir) {
+            Copy-Tree -Source $bepDir.FullName -Dest (Join-Path $InstallDir 'BepInEx')
+        }
+        if ($userDir) {
+            Copy-Tree -Source $userDir.FullName -Dest (Join-Path $InstallDir 'user')
+        }
     } else {
-        $modFolder = Join-Path $targetDir $name
-        if (Test-Path $modFolder) { Remove-Item -Recurse -Force $modFolder }
-        Move-Item -Path $staging -Destination $modFolder -Force
+        # Legacy fallback: drop the archive contents into install_to.
+        $targetDir = Join-Path $InstallDir ($installTo -replace '/', '\')
+        $null = New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+        $rootEntries = @(Get-ChildItem -LiteralPath $root -Force)
+        if ($rootEntries.Count -eq 1 -and $rootEntries[0].PSIsContainer) {
+            $modFolder = Join-Path $targetDir $rootEntries[0].Name
+            if (Test-Path $modFolder) { Remove-Item -Recurse -Force $modFolder }
+            Move-Item -Path $rootEntries[0].FullName -Destination $modFolder -Force
+            Log "No BepInEx/user folders found; installed as $modFolder"
+        } else {
+            $modFolder = Join-Path $targetDir $name
+            if (Test-Path $modFolder) { Remove-Item -Recurse -Force $modFolder }
+            $null = New-Item -ItemType Directory -Force -Path $modFolder | Out-Null
+            Copy-Tree -Source $root -Dest $modFolder
+            Log "No BepInEx/user folders found; copied loose contents to $modFolder"
+        }
     }
+
     Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
     Log "Installed $name"
 }
