@@ -27,8 +27,8 @@
 param(
     [Parameter(Mandatory)] [string] $EnrollUrl,
     [Parameter(Mandatory)] [string] $EnrollFingerprint,
-    [Parameter(Mandatory)] [string] $InviteToken,
-    [Parameter(Mandatory)] [string] $InstallDir
+    [Parameter(Mandatory)] [string] $InstallDir,
+    [string] $InviteToken = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -253,9 +253,13 @@ function Install-Mod {
 }
 
 # --- Main -------------------------------------------------------------------
+# /manifest is public on the server (it contains only public download URLs).
+# Send the Bearer header only when a token was supplied, so mod sync works
+# without VPN enrollment.
 Log "Fetching manifest from $EnrollUrl/manifest"
-$manifest = Invoke-RestMethod -Uri "$EnrollUrl/manifest" `
-    -Headers @{ Authorization = "Bearer $InviteToken" }
+$headers = @{}
+if ($InviteToken) { $headers['Authorization'] = "Bearer $InviteToken" }
+$manifest = Invoke-RestMethod -Uri "$EnrollUrl/manifest" -Headers $headers
 
 $required = @($manifest.required)
 $optional = @($manifest.optional)

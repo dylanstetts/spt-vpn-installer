@@ -195,7 +195,11 @@ def enroll() -> Any:
 
 @app.get("/manifest")
 def manifest() -> Any:
-    _require_token()
+    # No auth: the manifest only contains public download URLs (sp-tarkov
+    # Hub, GitHub releases, etc.) and is the only piece needed to install
+    # the mod list. Requiring an invite token here forced users running
+    # only the Mods component through the VPN enrollment flow, which is
+    # unnecessary and prevented standalone mod sync.
     if not MANIFEST_PATH.exists():
         abort(503, "manifest not yet published")
     return send_file(

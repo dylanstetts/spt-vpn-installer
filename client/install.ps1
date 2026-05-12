@@ -98,9 +98,7 @@ Log ("Selected components: " + ($selected -join ', '))
 if ((HasComponent 'VPN') -and (-not $InviteToken)) {
     throw "InviteToken is required when installing the VPN component."
 }
-if ((HasComponent 'Mods') -and (-not $InviteToken)) {
-    Log "WARNING: Mods selected without an invite token. Manifest fetch will likely fail."
-}
+# Mods alone is fine without a token: /manifest is public.
 
 # --- SPT installation validation -------------------------------------------
 function Test-SptInstallation {
