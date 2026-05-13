@@ -37,7 +37,8 @@ param(
     [Parameter(Mandatory)] [string] $EnrollUrl,
     [Parameter(Mandatory)] [string] $EnrollFingerprint,
     [Parameter(Mandatory)] [string] $InstallDir,
-    [string] $InviteToken = ''
+    [string] $InviteToken = '',
+    [switch] $Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,6 +69,49 @@ function Get-MagicKind([string]$path) {
 
 function Get-Sha256([string]$path) {
     (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLowerInvariant()
+}
+
+# --- Per-install state (skip already-installed mods) ------------------------
+# Stored at $InstallDir\.spt-vpn-mods-state.json. Schema:
+#   { "version": 1, "installed": { "<mod-name>": "<signature>", ... } }
+# Signature is recomputed each run from manifest + resolved GitHub asset.
+# When it matches the saved value, download/extract is skipped. Recovery
+# path: delete the state file (or pass -Force).
+function Get-ModStatePath([string]$InstallDir) {
+    return (Join-Path $InstallDir '.spt-vpn-mods-state.json')
+}
+
+function Load-ModState([string]$InstallDir) {
+    $path = Get-ModStatePath $InstallDir
+    if (-not (Test-Path -LiteralPath $path)) {
+        return [pscustomobject]@{ version = 1; installed = @{} }
+    }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Log "WARN: mods state file unreadable ($path); starting fresh."
+        return [pscustomobject]@{ version = 1; installed = @{} }
+    }
+    # ConvertFrom-Json yields PSCustomObject for the 'installed' map; convert
+    # to a real hashtable so .ContainsKey / index assignment works uniformly.
+    $installed = @{}
+    if ($obj.installed) {
+        foreach ($p in $obj.installed.PSObject.Properties) {
+            $installed[$p.Name] = [string]$p.Value
+        }
+    }
+    return [pscustomobject]@{ version = 1; installed = $installed }
+}
+
+function Save-ModState([string]$InstallDir, $State) {
+    $path = Get-ModStatePath $InstallDir
+    $null = New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent)
+    $payload = [pscustomobject]@{
+        version   = 1
+        installed = $State.installed
+    }
+    ($payload | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $path -Encoding UTF8
 }
 
 # Resolve a manifest 'github' block to a concrete asset download URL.
@@ -220,24 +264,35 @@ function Merge-Tree([string]$Source, [string]$Dest) {
 }
 
 function Install-Mod {
-    param($Entry, [string]$InstallDir, [string]$WorkDir, [bool]$Required)
+    param($Entry, [string]$InstallDir, [string]$WorkDir, [bool]$Required, $State, [bool]$Force)
 
     $name      = $Entry.name
     $installTo = if ($Entry.install_to) { $Entry.install_to } else { 'BepInEx/plugins' }
     $targetDir = Join-Path $InstallDir ($installTo -replace '/', '\')
 
     # Resolve download URL: prefer 'github' block, fall back to literal 'url'.
-    $url = $null
+    # Also compute a stable per-install signature so we can skip on re-run.
+    $url       = $null
+    $signature = $null
     if ($Entry.github -and $Entry.github.repo) {
         try {
-            $resolved = Resolve-GithubAsset $Entry.github
-            $url      = $resolved.Url
+            $resolved  = Resolve-GithubAsset $Entry.github
+            $url       = $resolved.Url
+            $signature = "github:$($Entry.github.repo)@$($resolved.Tag)/$($resolved.Asset)"
         } catch {
             $msg = "GitHub asset resolution failed for '$name': $($_.Exception.Message)"
             if ($Required) { throw $msg } else { Log "WARN: $msg"; return }
         }
     } elseif ($Entry.url) {
-        $url = [string]$Entry.url
+        $url       = [string]$Entry.url
+        $signature = "url:$url"
+    }
+
+    # Skip if state already records this exact signature for this name.
+    if (-not $Force -and $signature -and $State.installed.ContainsKey($name) -and
+        $State.installed[$name] -eq $signature) {
+        Log "Skipping $name (already installed: $signature)"
+        return
     }
 
     Log "Installing $name (required=$Required) -> $installTo (fallback)"
@@ -339,6 +394,14 @@ function Install-Mod {
     }
 
     Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
+
+    # Record success so we can skip on the next run.
+    if ($signature) {
+        $State.installed[$name] = $signature
+        try { Save-ModState -InstallDir $InstallDir -State $State }
+        catch { Log "WARN: failed to save mods state file: $($_.Exception.Message)" }
+    }
+
     Log "Installed $name"
 }
 
@@ -362,9 +425,12 @@ $workDir = Join-Path $env:TEMP 'spt-vpn-mods'
 if (Test-Path $workDir) { Remove-Item -Recurse -Force $workDir -ErrorAction SilentlyContinue }
 $null = New-Item -ItemType Directory -Force -Path $workDir
 
-foreach ($entry in $required) { Install-Mod -Entry $entry -InstallDir $InstallDir -WorkDir $workDir -Required $true }
+$state = Load-ModState -InstallDir $InstallDir
+if ($Force) { Log "Force flag set; ignoring saved mods state." }
+
+foreach ($entry in $required) { Install-Mod -Entry $entry -InstallDir $InstallDir -WorkDir $workDir -Required $true -State $state -Force:$Force }
 foreach ($entry in $optional) {
-    try { Install-Mod -Entry $entry -InstallDir $InstallDir -WorkDir $workDir -Required $false }
+    try { Install-Mod -Entry $entry -InstallDir $InstallDir -WorkDir $workDir -Required $false -State $state -Force:$Force }
     catch { Log "WARN: optional mod failed: $_" }
 }
 
